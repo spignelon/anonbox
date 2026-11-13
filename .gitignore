@@ -1,0 +1,7 @@
+# local test artifacts
+.tmp-out/
+anonbox-out/
+*.tar.gz
+.xfer.*
+.DS_Store
+*.swp

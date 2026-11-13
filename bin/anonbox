@@ -1,0 +1,588 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# anonbox - a disposable Debian workstation whose only network path is Tor.
+# Copyright (C) 2026 spignelon
+#
+# This program is free software: you can redistribute it and/or modify it under the terms of the
+# GNU General Public License as published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version. It is distributed WITHOUT ANY WARRANTY; see the
+# GNU General Public License for details: <https://www.gnu.org/licenses/>.
+#
+# Portability: written for bash 3.2+ (the version macOS ships) and POSIX/BSD userland tools.
+
+set -euo pipefail
+
+readonly ANONBOX_VERSION="0.1.0"
+readonly REPO_SLUG="spignelon/anonbox"
+
+# --------------------------------------------------------------------------------------------------
+# Locations
+# --------------------------------------------------------------------------------------------------
+
+# Resolve the directory this script really lives in, following symlinks (no `readlink -f` on macOS).
+resolve_dir() {
+  local src="$1" dir
+  while [ -L "$src" ]; do
+    dir="$(cd -P "$(dirname "$src")" && pwd)"
+    src="$(readlink "$src")"
+    case "$src" in /*) ;; *) src="$dir/$src" ;; esac
+  done
+  (cd -P "$(dirname "$src")" && pwd)
+}
+
+SELF_DIR="$(resolve_dir "${BASH_SOURCE[0]}")"
+ROOT_DIR="$(cd "$SELF_DIR/.." && pwd)"
+IMAGES_DIR="$ROOT_DIR/images"
+
+# --------------------------------------------------------------------------------------------------
+# Configuration (environment variables)
+# --------------------------------------------------------------------------------------------------
+
+NAME="${ANONBOX_NAME:-anonbox}"                          # prefix for container/network names
+SUBNET="${ANONBOX_SUBNET:-10.89.77.0/24}"                # private network between workstation and gateway
+OUT_DIR="${ANONBOX_OUT:-$HOME/anonbox-out}"              # where `anonbox get` puts files
+INSTALL_URL="${ANONBOX_INSTALL_URL:-https://raw.githubusercontent.com/$REPO_SLUG/main/install.sh}"
+
+GW="$NAME-gw"
+WS="$NAME-ws"
+NET="$NAME-net"
+IMG_GW="localhost/anonbox-gateway:$ANONBOX_VERSION"
+IMG_WS=""   # set in derive_gateway_ip: the workstation image embeds the gateway address, so it is tagged with it
+
+ENGINE=""
+DEFAULT_NET=""
+GW_IP=""
+
+# --------------------------------------------------------------------------------------------------
+# Output helpers
+# --------------------------------------------------------------------------------------------------
+
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  C_RED=$'\033[31m'; C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'; C_OFF=$'\033[0m'
+else
+  C_RED=""; C_GREEN=""; C_YELLOW=""; C_BOLD=""; C_DIM=""; C_OFF=""
+fi
+
+say()  { printf '%s[anonbox]%s %s\n' "$C_BOLD" "$C_OFF" "$*"; }
+warn() { printf '%s[anonbox] warning:%s %s\n' "$C_YELLOW" "$C_OFF" "$*" >&2; }
+die()  { printf '%s[anonbox] error:%s %s\n' "$C_RED" "$C_OFF" "$*" >&2; exit 1; }
+
+# --------------------------------------------------------------------------------------------------
+# Container engine abstraction (Podman or Docker)
+# --------------------------------------------------------------------------------------------------
+
+detect_engine() {
+  if [ -n "${ANONBOX_ENGINE:-}" ]; then
+    ENGINE="$ANONBOX_ENGINE"
+  elif command -v podman >/dev/null 2>&1; then
+    ENGINE=podman
+  elif command -v docker >/dev/null 2>&1; then
+    ENGINE=docker
+  else
+    die "no container engine found. Install Podman (recommended) or Docker, then run: anonbox doctor"
+  fi
+  case "$ENGINE" in podman|docker) ;; *) die "unsupported ANONBOX_ENGINE '$ENGINE' (use podman or docker)" ;; esac
+  command -v "$ENGINE" >/dev/null 2>&1 || die "'$ENGINE' is not installed or not in PATH"
+
+  # The default bridge network is called "podman" for Podman (and for the podman-docker shim) and "bridge" for Docker.
+  DEFAULT_NET=bridge
+  case "$ENGINE:$("$ENGINE" --version 2>/dev/null || true)" in
+    podman:*|*:*[Pp]odman*) DEFAULT_NET=podman ;;
+  esac
+}
+
+engine_ready() {
+  "$ENGINE" info >/dev/null 2>&1 && return 0
+  case "$(uname -s)" in
+    Darwin) die "cannot talk to $ENGINE. With Podman on macOS run: podman machine init && podman machine start (Docker Desktop/Colima/OrbStack must be running). Details: anonbox doctor" ;;
+    *)      die "cannot talk to $ENGINE (is the service running, do you have permission?). Details: anonbox doctor" ;;
+  esac
+}
+
+# The gateway is always <subnet>.2; the subnet must be an IPv4 /24.
+derive_gateway_ip() {
+  case "$SUBNET" in
+    [0-9]*.[0-9]*.[0-9]*.0/24) GW_IP="${SUBNET%.0/24}.2" ;;
+    *) die "ANONBOX_SUBNET must look like 10.89.77.0/24 (an IPv4 /24), got '$SUBNET'" ;;
+  esac
+  IMG_WS="localhost/anonbox-workstation:$ANONBOX_VERSION-$GW_IP"
+}
+
+init_engine() { derive_gateway_ip; detect_engine; engine_ready; }
+
+c_exists() { "$ENGINE" container inspect "$1" >/dev/null 2>&1; }
+i_exists() { "$ENGINE" image inspect "$1" >/dev/null 2>&1; }
+n_exists() { "$ENGINE" network inspect "$1" >/dev/null 2>&1; }
+running()  { [ "$("$ENGINE" container inspect -f '{{.State.Running}}' "$1" 2>/dev/null || echo false)" = true ]; }
+
+# Runs a command silently; shows its output only if it fails.
+quiet() {
+  local log
+  log="$(mktemp "${TMPDIR:-/tmp}/anonbox.XXXXXX")"
+  if "$@" >"$log" 2>&1; then rm -f "$log"; return 0; fi
+  cat "$log" >&2; rm -f "$log"; return 1
+}
+
+# --------------------------------------------------------------------------------------------------
+# Images, network, containers
+# --------------------------------------------------------------------------------------------------
+
+build_images() {
+  local rebuild="${1:-}" extra=""
+  [ "$rebuild" = rebuild ] && extra="--no-cache"
+
+  if [ "$rebuild" = rebuild ] || ! i_exists "$IMG_GW"; then
+    say "building the gateway image (Tor + privoxy); the build uses your normal network, not Tor"
+    # shellcheck disable=SC2086  # $extra is intentionally empty or a single flag
+    quiet "$ENGINE" build $extra -t "$IMG_GW" -f "$IMAGES_DIR/gateway/Containerfile" \
+      --build-arg "ANONBOX_VERSION=$ANONBOX_VERSION" "$IMAGES_DIR/gateway" || die "gateway image build failed"
+  fi
+
+  if [ "$rebuild" = rebuild ] || ! i_exists "$IMG_WS"; then
+    say "building the workstation image (Debian + tools + uv)"
+    # shellcheck disable=SC2086
+    quiet "$ENGINE" build $extra -t "$IMG_WS" -f "$IMAGES_DIR/workstation/Containerfile" \
+      --build-arg "ANONBOX_VERSION=$ANONBOX_VERSION" --build-arg "GATEWAY_IP=$GW_IP" \
+      "$IMAGES_DIR/workstation" || die "workstation image build failed"
+  fi
+}
+
+ensure_net() {
+  n_exists "$NET" && return 0
+  local out
+  if ! out="$("$ENGINE" network create --internal --subnet "$SUBNET" "$NET" 2>&1)"; then
+    printf '%s\n' "$out" >&2
+    die "could not create the private network '$NET' ($SUBNET). If the range overlaps one of yours, choose another: ANONBOX_SUBNET=10.201.5.0/24 anonbox up"
+  fi
+}
+
+create_gateway() {
+  ensure_net
+  # Created on the engine's normal bridge (outbound access for Tor) first, then joined to the internal
+  # network at a fixed address. The workstation is never attached to the normal bridge.
+  "$ENGINE" create --name "$GW" --hostname "$GW" --init \
+    --network "$DEFAULT_NET" \
+    --cap-drop ALL --security-opt no-new-privileges \
+    --pids-limit 256 --log-opt max-size=5m \
+    -e "GATEWAY_IP=$GW_IP" \
+    --label org.anonbox.role=gateway \
+    "$IMG_GW" >/dev/null
+  if ! "$ENGINE" network connect --ip "$GW_IP" "$NET" "$GW" >/dev/null 2>&1; then
+    "$ENGINE" rm -f "$GW" >/dev/null 2>&1 || true
+    die "could not attach the gateway to $NET at $GW_IP (address in use? try another ANONBOX_SUBNET)"
+  fi
+}
+
+create_workstation() {
+  ensure_net
+  "$ENGINE" create --name "$WS" --hostname "$NAME" --init \
+    --network "$NET" \
+    --cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER \
+    --cap-add SETUID --cap-add SETGID --cap-add KILL \
+    --security-opt no-new-privileges \
+    --pids-limit 1024 \
+    --label org.anonbox.role=workstation \
+    "$IMG_WS" >/dev/null
+}
+
+# Asks Tor itself (over its control socket) how far along the bootstrap is; prints 0 if unreachable.
+tor_progress() {
+  # shellcheck disable=SC2016  # the script is meant to be expanded inside the container, not here
+  "$ENGINE" exec -u debian-tor "$GW" sh -c \
+    'c=$(od -An -tx1 /var/lib/tor/control_auth_cookie 2>/dev/null | tr -d " \n"); [ -n "$c" ] || { echo 0; exit 0; }
+     printf "AUTHENTICATE %s\r\nGETINFO status/bootstrap-phase\r\nQUIT\r\n" "$c" \
+       | nc -U -w3 /var/lib/tor/control.sock 2>/dev/null | tr -d "\r" \
+       | sed -n "s/.*PROGRESS=\([0-9]*\).*/\1/p" | head -1' 2>/dev/null || echo 0
+}
+
+wait_for_tor() {
+  say "waiting for Tor to bootstrap (up to 3 minutes)..."
+  local attempt pr=0
+  for attempt in $(seq 1 90); do
+    : "$attempt"
+    pr="$(tor_progress)"; pr="${pr:-0}"
+    if [ "$pr" = 100 ]; then say "Tor is up"; return 0; fi
+    running "$GW" || { "$ENGINE" logs --tail 20 "$GW" >&2 || true; die "the gateway stopped unexpectedly"; }
+    sleep 2
+  done
+  "$ENGINE" logs --tail 20 "$GW" >&2 || true
+  die "Tor did not finish bootstrapping (last progress: ${pr}%). Some networks block Tor; see GUIDE.md > Troubleshooting"
+}
+
+need_up() {
+  if ! running "$WS" || ! running "$GW"; then die "anonbox is not running. Start it with: anonbox up"; fi
+}
+
+# Resolves a directory inside the workstation: relative paths are under /home/user.
+wsdir() { case "$1" in /*) printf '%s\n' "$1" ;; *) printf '/home/user/%s\n' "$1" ;; esac; }
+
+# --------------------------------------------------------------------------------------------------
+# Commands
+# --------------------------------------------------------------------------------------------------
+
+cmd_up() {
+  local rebuild=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --rebuild) rebuild=rebuild ;;
+      *) die "usage: anonbox up [--rebuild]" ;;
+    esac; shift
+  done
+  init_engine
+  build_images "$rebuild"
+  if ! c_exists "$GW"; then say "starting the Tor gateway"; create_gateway; fi
+  running "$GW" || "$ENGINE" start "$GW" >/dev/null
+  wait_for_tor
+  if ! c_exists "$WS"; then say "creating the workstation"; create_workstation; fi
+  running "$WS" || "$ENGINE" start "$WS" >/dev/null
+  say "ready. Open a shell with: anonbox shell"
+}
+
+cmd_shell() {
+  init_engine; need_up
+  local user=user dir=/home/user
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --root) user=root ;;
+      -C) shift; dir="$(wsdir "${1:?-C needs a directory}")" ;;
+      *) die "usage: anonbox shell [--root] [-C DIR]" ;;
+    esac; shift
+  done
+  exec "$ENGINE" exec -it --user "$user" -w "$dir" "$WS" bash -l
+}
+
+cmd_run() {
+  init_engine; need_up
+  local dir=/home/user tty=-i
+  if [ "${1:-}" = "-C" ]; then shift; dir="$(wsdir "${1:?-C needs a directory}")"; shift; fi
+  [ $# -ge 1 ] || die "usage: anonbox run [-C DIR] COMMAND [ARGS...]"
+  [ -t 0 ] && tty=-it
+  exec "$ENGINE" exec "$tty" --user user -w "$dir" "$WS" "$@"
+}
+
+# Absolute path of an existing file or directory (no `readlink -f` on macOS).
+abspath() {
+  local p="$1" d
+  d="$(cd -P "$(dirname "$p")" 2>/dev/null && pwd)" || return 1
+  printf '%s/%s\n' "${d%/}" "$(basename "$p")"
+}
+
+# anonbox put PATH...   host -> workstation (~/in). Symlinks are NOT followed, so a link in a folder
+# you copy can never pull in a file you did not name.
+cmd_put() {
+  init_engine; need_up
+  [ $# -ge 1 ] || die "usage: anonbox put FILE_OR_DIR..."
+  local args=() f abs
+  for f in "$@"; do
+    [ -e "$f" ] || [ -L "$f" ] || die "no such file or directory: $f"
+    abs="$(abspath "$f")" || die "cannot resolve: $f"
+    args+=(-C "$(dirname "$abs")" "$(basename "$abs")")
+  done
+  COPYFILE_DISABLE=1 tar -cf - "${args[@]}" \
+    | "$ENGINE" exec -i --user user -w /home/user/in "$WS" tar -xf - --no-same-owner
+  say "copied into the workstation: /home/user/in/"
+}
+
+# anonbox get PATH...   workstation -> host quarantine folder ($OUT_DIR/<timestamp>).
+# Files get no execute bit and symlinks are copied as plain files, so nothing can point at your files.
+cmd_get() {
+  init_engine; need_up
+  [ $# -ge 1 ] || die "usage: anonbox get PATH_IN_WORKSTATION..."
+  local dest p got=0
+  dest="$OUT_DIR/$(date +%Y%m%d-%H%M%S)"
+  ( umask 077; mkdir -p "$dest" )
+  chmod 700 "$OUT_DIR" "$dest" 2>/dev/null || true
+  for p in "$@"; do
+    p="$(wsdir "$p")"
+    if ! "$ENGINE" exec --user user "$WS" test -e "$p"; then
+      warn "not found in the workstation: $p"; continue
+    fi
+    ( umask 077
+      "$ENGINE" exec --user user "$WS" tar -chf - -C "$(dirname "$p")" "$(basename "$p")" \
+        | tar -xf - -C "$dest" )
+    got=$((got + 1))
+  done
+  find "$dest" -type f -exec chmod a-x {} + 2>/dev/null || true
+  if [ "$got" -eq 0 ]; then rmdir "$dest" 2>/dev/null || true; die "nothing was copied"; fi
+  say "copied to $dest"
+  say "treat it as untrusted: no execute bits, symlinks flattened. Inspect before opening."
+  ls -la "$dest"
+}
+
+cmd_newid() {
+  init_engine
+  running "$GW" || die "the gateway is not running"
+  local reply
+  # shellcheck disable=SC2016  # the script is meant to be expanded inside the container, not here
+  reply="$("$ENGINE" exec -u debian-tor "$GW" sh -c \
+    'c=$(od -An -tx1 /var/lib/tor/control_auth_cookie | tr -d " \n"); printf "AUTHENTICATE %s\r\nSIGNAL NEWNYM\r\nQUIT\r\n" "$c" | nc -U -w3 /var/lib/tor/control.sock' \
+    | tr -d '\r' || true)"
+  case "$reply" in
+    *"250 OK"*) say "asked Tor for new circuits (new exit IP for new connections)" ;;
+    *) die "Tor did not accept the request" ;;
+  esac
+}
+
+cmd_ip() {
+  init_engine; need_up
+  "$ENGINE" exec --user user "$WS" curl -s --max-time 60 https://check.torproject.org/api/ip || die "request failed"
+  echo
+}
+
+cmd_logs() { init_engine; c_exists "$GW" || die "no gateway container"; "$ENGINE" logs --tail "${1:-50}" "$GW"; }
+
+cmd_status() {
+  init_engine
+  local c state
+  for c in "$GW" "$WS"; do
+    if c_exists "$c"; then state="$("$ENGINE" container inspect -f '{{.State.Status}}' "$c")"; else state="not created"; fi
+    printf '%-14s %s\n' "$c" "$state"
+  done
+  if running "$GW"; then printf '%-14s %s%%\n' "tor bootstrap" "$(tor_progress)"; fi
+  printf '%-14s %s (%s)\n' "engine" "$ENGINE" "$("$ENGINE" --version 2>/dev/null | head -1)"
+  printf '%-14s %s via %s\n' "network" "$SUBNET" "$NET"
+}
+
+cmd_stop() {
+  init_engine
+  local c
+  for c in "$WS" "$GW"; do running "$c" && "$ENGINE" stop -t 3 "$c" >/dev/null; done
+  say "stopped. Files in the workstation are kept; 'anonbox up' continues where you left off"
+}
+
+cmd_down() {
+  init_engine
+  if [ "${1:-}" != "-y" ]; then
+    printf 'This DELETES the workstation and everything in it (copy files out first with: anonbox get). Continue? [y/N] '
+    local a=""; read -r a </dev/tty 2>/dev/null || read -r a || true
+    case "$a" in y|Y|yes|YES) ;; *) die "cancelled" ;; esac
+  fi
+  "$ENGINE" rm -f "$WS" "$GW" >/dev/null 2>&1 || true
+  "$ENGINE" network rm "$NET" >/dev/null 2>&1 || true
+  say "removed the containers and the private network (images are kept; 'anonbox purge' removes them too)"
+}
+
+cmd_purge() {
+  cmd_down "${1:-}"
+  init_engine
+  "$ENGINE" rmi "$IMG_WS" >/dev/null 2>&1 || true
+  "$ENGINE" rmi "$IMG_GW" >/dev/null 2>&1 || warn "the gateway image is still used by another anonbox instance; kept"
+  say "removed the images of this instance"
+}
+
+cmd_update() {
+  command -v curl >/dev/null 2>&1 || die "curl is required for 'anonbox update'"
+  say "re-running the installer from $INSTALL_URL"
+  curl -fsSL "$INSTALL_URL" | bash -s -- --update "$@"
+  say "run 'anonbox up --rebuild' to rebuild the images with the new version"
+}
+
+cmd_uninstall() {
+  [ -f "$ROOT_DIR/install.sh" ] || die "install.sh not found next to the program; remove $ROOT_DIR and the symlink by hand"
+  exec bash "$ROOT_DIR/install.sh" --uninstall "$@"
+}
+
+# --------------------------------------------------------------------------------------------------
+# check: leak tests, executed inside the workstation
+# --------------------------------------------------------------------------------------------------
+
+cmd_check() {
+  init_engine; need_up
+  say "leak checks (everything below runs inside the workstation)"
+  "$ENGINE" exec -i -e "GW_IP=$GW_IP" --user user "$WS" bash -s <<'CHECK'
+ok()  { printf '  [ OK ] %s\n' "$*"; }
+bad() { printf '  [FAIL] %s\n' "$*"; FAILED=1; }
+FAILED=0
+r=$(curl -s --max-time 60 https://check.torproject.org/api/ip || true)
+if echo "$r" | grep -q '"IsTor":true'; then ok "web traffic exits through Tor: $r"; else bad "NOT Tor: ${r:-no answer}"; fi
+if env -u ALL_PROXY -u all_proxy -u HTTP_PROXY -u http_proxy -u HTTPS_PROXY -u https_proxy curl -s --max-time 8 -o /dev/null https://example.com 2>/dev/null; then
+  bad "a direct connection (ignoring the proxy) worked"; else ok "a direct connection that ignores the proxy fails (no route out)"; fi
+if getent hosts example.com >/dev/null 2>&1; then bad "local DNS resolution works (would leak)"; else ok "no local DNS (names are only resolved by Tor)"; fi
+if ip route 2>/dev/null | grep -q default; then bad "there is a default route: $(ip route | tr '\n' ';')"; else ok "no default route"; fi
+python3 - <<'PY'
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(4)
+try:
+    s.connect(("1.1.1.1", 53)); s.send(b"x"); s.recv(512); print("  [FAIL] UDP reached the internet")
+except Exception as e:
+    print("  [ OK ] direct UDP is impossible (%s)" % type(e).__name__)
+try:
+    socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP); print("  [FAIL] raw sockets allowed")
+except Exception as e:
+    print("  [ OK ] raw sockets denied (%s)" % type(e).__name__)
+PY
+for p in 22 53 9051 8080; do
+  if timeout 4 bash -c "echo > /dev/tcp/$GW_IP/$p" 2>/dev/null; then bad "gateway port $p is open to the workstation"; else ok "gateway port $p closed"; fi
+done
+for p in 9050 8118; do
+  if timeout 4 bash -c "echo > /dev/tcp/$GW_IP/$p" 2>/dev/null; then ok "gateway port $p (Tor proxy) reachable, as intended"; else bad "Tor proxy port $p not reachable"; fi
+done
+exit "$FAILED"
+CHECK
+}
+
+# --------------------------------------------------------------------------------------------------
+# doctor: pre-flight checks for this machine
+# --------------------------------------------------------------------------------------------------
+
+cmd_doctor() {
+  local fails=0 warns=0
+  d_ok()   { printf '  %s[ OK ]%s %s\n' "$C_GREEN" "$C_OFF" "$*"; }
+  d_warn() { printf '  %s[WARN]%s %s\n' "$C_YELLOW" "$C_OFF" "$*"; warns=$((warns + 1)); }
+  d_fail() { printf '  %s[FAIL]%s %s\n' "$C_RED" "$C_OFF" "$*"; fails=$((fails + 1)); }
+  d_hint() { printf '         %s%s%s\n' "$C_DIM" "$*" "$C_OFF"; }
+
+  derive_gateway_ip
+  local os arch kernel
+  os="$(uname -s)"; arch="$(uname -m)"; kernel="$(uname -r)"
+
+  printf '%sanonbox %s: pre-flight checks%s\n\n' "$C_BOLD" "$ANONBOX_VERSION" "$C_OFF"
+  printf '%sSystem%s\n' "$C_BOLD" "$C_OFF"
+  case "$os" in
+    Linux)
+      if grep -qi microsoft /proc/version 2>/dev/null; then
+        case "$kernel" in
+          *[Ww][Ss][Ll]2*|*microsoft-standard*) d_ok "Windows Subsystem for Linux 2 ($arch)" ;;
+          *) d_fail "this looks like WSL 1, which cannot run containers"; d_hint "convert it: wsl --set-version <distro> 2" ;;
+        esac
+      else
+        d_ok "Linux $kernel ($arch)"
+      fi ;;
+    Darwin) d_ok "macOS $(sw_vers -productVersion 2>/dev/null || echo '?') ($arch)" ;;
+    *) d_fail "unsupported operating system: $os (anonbox needs Linux, macOS, or Windows through WSL2)" ;;
+  esac
+  if [ "${BASH_VERSINFO[0]}" -ge 3 ]; then d_ok "bash $BASH_VERSION"; else d_fail "bash $BASH_VERSION is too old (need 3.2+)"; fi
+  local t
+  for t in tar curl; do
+    if command -v "$t" >/dev/null 2>&1; then d_ok "$t found"; else
+      if [ "$t" = curl ] && command -v wget >/dev/null 2>&1; then d_ok "wget found (curl is only needed for the installer)"; else d_warn "$t not found"; fi
+    fi
+  done
+  local free_kb
+  free_kb="$(df -Pk "$HOME" 2>/dev/null | awk 'NR==2 {print $4}')"
+  if [ -n "$free_kb" ]; then
+    if [ "$free_kb" -ge 2097152 ]; then d_ok "free disk space in \$HOME: $((free_kb / 1024)) MB"
+    else d_warn "only $((free_kb / 1024)) MB free in \$HOME (the images need about 1 GB)"; fi
+  fi
+
+  printf '\n%sContainer engine%s\n' "$C_BOLD" "$C_OFF"
+  if detect_engine 2>/dev/null; then
+    d_ok "$ENGINE found: $("$ENGINE" --version 2>/dev/null | head -1)"
+    if "$ENGINE" info >/dev/null 2>&1; then
+      d_ok "$ENGINE is reachable"
+      case "$ENGINE:$DEFAULT_NET" in
+        podman:*|docker:podman)
+          if [ "$("$ENGINE" info --format '{{.Host.Security.Rootless}}' 2>/dev/null)" = true ]; then d_ok "rootless mode (recommended: container root is an unprivileged user on your machine)"
+          elif [ "$os" = Darwin ]; then d_ok "running inside the Podman machine VM"
+          else d_warn "rootful Podman: weaker isolation than rootless"; fi ;;
+        docker:*)
+          if "$ENGINE" info --format '{{.SecurityOptions}}' 2>/dev/null | grep -qi rootless; then d_ok "rootless Docker"
+          elif [ "$os" = Linux ] && ! grep -qi microsoft /proc/version 2>/dev/null; then
+            d_warn "the Docker daemon runs as root on this host: a container escape would be root on your machine"
+            d_hint "prefer Podman (rootless) or rootless Docker; anonbox works with all three"
+          else d_ok "Docker runs in a VM on this system"; fi ;;
+      esac
+      if [ "$os" = Linux ] && [ "$ENGINE" = podman ]; then
+        if [ -r /etc/subuid ] && grep -q "^$(id -un):" /etc/subuid 2>/dev/null; then d_ok "subuid/subgid ranges configured for $(id -un)"
+        else d_warn "no /etc/subuid entry for $(id -un): rootless Podman may not work"; d_hint "sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $(id -un) && podman system migrate"; fi
+      fi
+      if n_exists "$NET"; then d_ok "private network '$NET' exists"
+      else
+        local probe="$NAME-probe-$$"
+        if "$ENGINE" network create --internal --subnet "$SUBNET" "$probe" >/dev/null 2>&1; then
+          d_ok "can create an internal network on $SUBNET"; "$ENGINE" network rm "$probe" >/dev/null 2>&1 || true
+        else d_fail "cannot create an internal network on $SUBNET (range already in use?)"; d_hint "choose another range: ANONBOX_SUBNET=10.201.5.0/24 anonbox up"; fi
+      fi
+    else
+      d_fail "$ENGINE is installed but not reachable"
+      case "$os" in
+        Darwin) d_hint "start your engine: podman machine init && podman machine start   (or open Docker Desktop / Colima / OrbStack)" ;;
+        *) d_hint "Podman: check 'podman info'; Docker: start the service (sudo systemctl start docker) and add yourself to the docker group" ;;
+      esac
+    fi
+  else
+    d_fail "no container engine found"
+    d_hint "install Podman (recommended): see GUIDE.md > Installing a container engine"
+  fi
+
+  printf '\n%sNetwork%s\n' "$C_BOLD" "$C_OFF"
+  if command -v curl >/dev/null 2>&1; then
+    local code
+    code="$(curl -s -o /dev/null -m 10 -w '%{http_code}' https://registry-1.docker.io/v2/ 2>/dev/null || true)"
+    case "$code" in 200|401) d_ok "can reach the container registry (needed once, to fetch the Debian base image)" ;;
+      *) d_warn "cannot reach registry-1.docker.io (HTTP '${code:-none}'): the first build needs it" ;; esac
+  else
+    d_warn "curl missing: skipping the registry check"
+  fi
+
+  printf '\n'
+  if [ "$fails" -gt 0 ]; then printf '%s%d problem(s) must be fixed before anonbox can run.%s\n' "$C_RED" "$fails" "$C_OFF"; return 1; fi
+  if [ "$warns" -gt 0 ]; then printf '%sReady, with %d warning(s).%s\n' "$C_YELLOW" "$warns" "$C_OFF"; else printf '%sAll good. Start with: anonbox up%s\n' "$C_GREEN" "$C_OFF"; fi
+}
+
+# --------------------------------------------------------------------------------------------------
+# help / dispatch
+# --------------------------------------------------------------------------------------------------
+
+usage() {
+  cat <<EOF
+anonbox $ANONBOX_VERSION - a disposable Debian workstation whose only network path is Tor
+
+Usage: anonbox COMMAND [ARGS]
+
+Workflow
+  up [--rebuild]              build (first run), start the Tor gateway and the workstation
+  shell [--root] [-C DIR]     open a shell in the workstation (--root for apt install; no network powers either way)
+  run [-C DIR] COMMAND...     run one command, e.g.  anonbox run -C project uv run script.py
+  put PATH...                 copy files/folders from this machine INTO the workstation (~/in)
+  get PATH...                 copy files/folders OUT to \$ANONBOX_OUT/<timestamp>/ (quarantine)
+  stop                        stop everything, keep the workstation's files
+  down [-y]                   delete the workstation and its files (amnesic reset)
+
+Inspect
+  check                       verify Tor routing and the leak protections (12 checks)
+  ip                          show the Tor exit IP the workstation currently has
+  newid                       ask Tor for new circuits (new exit IP for new connections)
+  status                      show container state and Tor bootstrap progress
+  logs [N]                    show the last N lines of the Tor gateway log
+  doctor                      pre-flight checks for this machine
+
+Maintenance
+  update                      re-run the installer (then: anonbox up --rebuild)
+  purge [-y]                  down + remove the images
+  uninstall [-y]              remove anonbox itself (run 'anonbox purge' first)
+  version                     print the version
+
+Environment: ANONBOX_ENGINE (podman|docker), ANONBOX_SUBNET ($SUBNET), ANONBOX_OUT ($OUT_DIR),
+             ANONBOX_NAME ($NAME). Docs: https://github.com/$REPO_SLUG
+EOF
+}
+
+main() {
+  local cmd="${1:-help}"
+  [ $# -gt 0 ] && shift
+  case "$cmd" in
+    up) cmd_up "$@" ;;
+    shell) cmd_shell "$@" ;;
+    run) cmd_run "$@" ;;
+    put) cmd_put "$@" ;;
+    get) cmd_get "$@" ;;
+    check) cmd_check ;;
+    ip) cmd_ip ;;
+    newid) cmd_newid ;;
+    status) cmd_status ;;
+    logs) cmd_logs "$@" ;;
+    stop) cmd_stop ;;
+    down) cmd_down "$@" ;;
+    purge) cmd_purge "$@" ;;
+    doctor) cmd_doctor ;;
+    update) cmd_update "$@" ;;
+    uninstall) cmd_uninstall "$@" ;;
+    version|--version|-V) echo "anonbox $ANONBOX_VERSION" ;;
+    help|--help|-h) usage ;;
+    *) usage >&2; exit 2 ;;
+  esac
+}
+
+main "$@"

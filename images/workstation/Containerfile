@@ -1,0 +1,40 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# anonbox workstation: a Debian userland with common tools. Its only way out is the Tor gateway.
+FROM docker.io/library/debian:trixie-slim
+
+# Address of the gateway on the private anonbox network (the CLI passes the real one).
+ARG GATEWAY_IP=10.89.77.2
+ARG ANONBOX_VERSION=dev
+LABEL org.opencontainers.image.title="anonbox-workstation" \
+      org.opencontainers.image.description="Disposable workstation for anonbox" \
+      org.opencontainers.image.licenses="GPL-3.0-or-later" \
+      org.opencontainers.image.version="${ANONBOX_VERSION}" \
+      org.anonbox.role="workstation" \
+      org.anonbox.version="${ANONBOX_VERSION}" \
+      org.anonbox.gateway-ip="${GATEWAY_IP}"
+
+ENV DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      ca-certificates curl wget aria2 git openssh-client \
+      python3 python3-pip python3-venv pipx \
+      unzip xz-utils bzip2 zstd tar gzip p7zip-full \
+      jq file less nano procps dnsutils netcat-openbsd iproute2 \
+ && pipx install --global uv \
+ && rm -rf /var/lib/apt/lists/*
+
+# The ONLY way out is Tor on the gateway. Hostnames are resolved by Tor (socks5h), never locally.
+ENV ALL_PROXY=socks5h://${GATEWAY_IP}:9050 \
+    all_proxy=socks5h://${GATEWAY_IP}:9050 \
+    HTTP_PROXY=http://${GATEWAY_IP}:8118 http_proxy=http://${GATEWAY_IP}:8118 \
+    HTTPS_PROXY=http://${GATEWAY_IP}:8118 https_proxy=http://${GATEWAY_IP}:8118 \
+    NO_PROXY= no_proxy=
+RUN printf 'Acquire::http::Proxy "socks5h://%s:9050";\nAcquire::https::Proxy "socks5h://%s:9050";\nAcquire::Retries "5";\nAcquire::http::Timeout "60";\nAcquire::https::Timeout "60";\n' \
+      "${GATEWAY_IP}" "${GATEWAY_IP}" > /etc/apt/apt.conf.d/99anonbox \
+ && printf 'Host *\n  ProxyCommand nc -X 5 -x %s:9050 %%h %%p\n' "${GATEWAY_IP}" > /etc/ssh/ssh_config.d/99-anonbox.conf
+
+RUN useradd -m -u 1000 -s /bin/bash user \
+ && install -d -o user -g user /home/user/in /home/user/work
+USER user
+WORKDIR /home/user
+CMD ["sleep", "infinity"]

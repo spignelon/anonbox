@@ -1,0 +1,12 @@
+# anonbox gateway: pure pass-through HTTP/HTTPS(CONNECT) proxy in front of Tor's SOCKS port.
+# No ad blocking, no content filtering: it only exists because Tor's own HTTPTunnelPort cannot forward
+# plain http:// requests.
+confdir /etc/privoxy
+listen-address @GATEWAY_IP@:8118
+toggle 0
+enable-remote-toggle 0
+enable-edit-actions 0
+enable-remote-http-toggle 0
+forward-socks5t / @GATEWAY_IP@:9050 .
+keep-alive-timeout 60
+socket-timeout 300

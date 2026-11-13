@@ -1,0 +1,15 @@
+# anonbox gateway: Tor. @GATEWAY_IP@ is filled in at start-up (entrypoint.sh).
+DataDirectory /var/lib/tor
+ClientOnly 1
+ClientUseIPv6 0
+AvoidDiskWrites 1
+SafeLogging 1
+Log notice stdout
+
+# SOCKS5 for the workstation, reachable only on the private anonbox network.
+SocksPort @GATEWAY_IP@:9050
+
+# Control interface: a unix socket inside this container, never a network port (used by `anonbox newid`
+# and by the start-up check).
+ControlSocket /var/lib/tor/control.sock
+CookieAuthentication 1

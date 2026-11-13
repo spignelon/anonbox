@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      smoke:
+        description: "Also run the end-to-end smoke test (talks to the real Tor network)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint (bash -n + shellcheck)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: tests/lint.sh
+
+  bash32:
+    name: Runs on bash 3.2 (macOS bash)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax and basic commands under bash 3.2
+        run: |
+          docker run --rm -v "$PWD:/x:ro" docker.io/library/bash:3.2 bash -c '
+            set -e
+            bash -n /x/bin/anonbox
+            bash -n /x/install.sh
+            bash /x/bin/anonbox version
+            bash /x/bin/anonbox help >/dev/null
+            bash /x/install.sh --help >/dev/null
+          '
+
+  powershell:
+    name: PowerShell installer parses
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - shell: pwsh
+        run: |
+          $errors = $null; $tokens = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile("$PWD/install.ps1", [ref]$tokens, [ref]$errors)
+          if ($errors.Count -gt 0) { $errors | ForEach-Object { Write-Error $_.Message }; exit 1 }
+
+  images:
+    name: Images build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the gateway image
+        run: docker build -f images/gateway/Containerfile -t anonbox-gateway images/gateway
+      - name: Build the workstation image
+        run: docker build -f images/workstation/Containerfile -t anonbox-workstation images/workstation
+
+  installer:
+    name: Installer installs and uninstalls
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install from the checkout into a throw-away prefix, then remove it
+        run: |
+          export ANONBOX_PREFIX="$RUNNER_TEMP/prefix" ANONBOX_BIN_DIR="$RUNNER_TEMP/bin"
+          ./install.sh --local --no-doctor --yes
+          "$ANONBOX_BIN_DIR/anonbox" version
+          ./install.sh --uninstall --yes
+          test ! -e "$ANONBOX_PREFIX"
+
+  smoke:
+    name: Smoke test (Docker, real Tor network)
+    if: github.event_name == 'workflow_dispatch' && inputs.smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - run: ANONBOX_ENGINE=docker tests/smoke.sh

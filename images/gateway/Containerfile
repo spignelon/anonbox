@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# anonbox gateway: Tor + a pass-through HTTP proxy, listening only on the private anonbox network.
+FROM docker.io/library/debian:trixie-slim
+
+ARG ANONBOX_VERSION=dev
+LABEL org.opencontainers.image.title="anonbox-gateway" \
+      org.opencontainers.image.description="Tor gateway for anonbox" \
+      org.opencontainers.image.licenses="GPL-3.0-or-later" \
+      org.opencontainers.image.version="${ANONBOX_VERSION}" \
+      org.anonbox.role="gateway" \
+      org.anonbox.version="${ANONBOX_VERSION}"
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends tor privoxy netcat-openbsd ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY torrc.template /etc/anonbox/torrc.template
+COPY privoxy.conf.template /etc/anonbox/privoxy.conf.template
+COPY entrypoint.sh /usr/local/bin/anonbox-gateway
+RUN chmod 0755 /usr/local/bin/anonbox-gateway \
+ && install -d -o debian-tor -g debian-tor -m 0700 /var/lib/tor
+
+USER debian-tor
+ENTRYPOINT ["/usr/local/bin/anonbox-gateway"]
