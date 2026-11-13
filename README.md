@@ -143,7 +143,7 @@ Update with `anonbox update`; uninstall with `anonbox purge` then `anonbox unins
 | Platform | Container engine | Status |
 |---|---|---|
 | **Linux** (Debian/Ubuntu, Fedora/RHEL, openSUSE, Arch) | Podman (rootless, recommended) | ✅ Tested on openSUSE Tumbleweed |
-| Linux | Docker (rootful, or rootless Docker) | ✅ Tested on openSUSE Tumbleweed (rootful) |
+| Linux | Docker (rootful, or rootless Docker) | ✅ Tested on openSUSE Tumbleweed and on Ubuntu (GitHub Actions) with rootful Docker |
 | **macOS** (recent versions, Intel and Apple silicon) | Podman machine, Docker Desktop, Colima, OrbStack | 🟡 Expected to work, **not yet tested** |
 | **Windows 10 (2004+) / 11** | WSL2 + Podman or Docker Desktop (WSL integration) | 🟡 Expected to work, **not yet tested** |
 | FreeBSD, native Windows shells, WSL1 | n/a | ❌ Not supported (need Linux containers / user-defined networks) |

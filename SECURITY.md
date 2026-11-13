@@ -107,6 +107,7 @@ Installer:
 
 - Linux (openSUSE Tumbleweed, kernel 7.x), **Podman 6.1 rootless** and **Docker 29.7 (rootful)**: `anonbox check` (12 checks), file
   transfer, stop/resume, reset, `.onion` access, and common tools (curl, wget, aria2, git, pip, uv, ssh, apt) through Tor.
+- The full end-to-end smoke test (`tests/smoke.sh`) also runs on an Ubuntu GitHub Actions runner with Docker.
 - Installer on Ubuntu 24.04, Fedora, Arch Linux containers (platform and package-manager detection, program install).
 - The CLI and installer run under bash 3.2 (the macOS bash) in a container.
 - **Not yet tested:** macOS (Podman machine, Docker Desktop, Colima, OrbStack), Windows (WSL2), Apple silicon. They are expected to
